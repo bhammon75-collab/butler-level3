@@ -136,4 +136,41 @@ app.post('/run', async (req: Request, res: Response) => {
 /* ------------------------------ dispatch helper -------------------------- */
 async function dispatch(req: Request, tool: string, action: string, args: Record<string, unknown>, _plan: RunReqT) {
   if (tool === 'github' && action === 'write_file') {
-    const p = (args as any)?.path as string | undefin
+    const p = (args as any)?.path as string | undefined
+    if (p && isWorkflowPath(p)) {
+      const header = req.header('X-Butler-Approve-Workflows') || ''
+      if (!ENV.WORKFLOW_EDIT_KEY || header !== ENV.WORKFLOW_EDIT_KEY) {
+        throw new Error('workflow_edit_blocked: send X-Butler-Approve-Workflows header')
+      }
+    }
+  }
+
+  if (tool === 'github') {
+    if (action === 'create_branch') return githubTools.create_branch(args as any)
+    if (action === 'write_file')   return githubTools.write_file(args as any)
+    if (action === 'open_pr')      return githubTools.open_pr(args as any)
+  }
+  if (tool === 'supabase') {
+    if (action === 'deploy_function')  return supabaseTools.deploy_function(args as any)
+    if (action === 'set_function_env') return supabaseTools.set_function_env(args as any)
+    if (action === 'invoke_rpc')       return supabaseTools.invoke_rpc(args as any)
+    if (action === 'sql_migrate')      return supabaseTools.sql_migrate(args as any)
+  }
+  if (tool === 'stripe' && action === 'read_connect_account') return stripeTools.read_connect_account(args as any)
+  if (tool === 'deploy' && action === 'create_preview') return deployTools.create_preview(args as any)
+  if (tool === 'email'  && action === 'send_test') return emailTools.send_test(args as any)
+
+  throw new Error(`unknown_tool_or_action: ${tool}.${action}`)
+}
+
+/* --------------------------------- utils --------------------------------- */
+function sanitize(b: string): string {
+  return b.trim().replace(/\s+/g, '-').replace(/[^a-zA-Z0-9/_-]/g, '').slice(0, 100)
+}
+
+/* ------------------------------- start server ---------------------------- */
+const PORT = process.env.PORT || 8787
+app.listen(PORT, () => {
+  // eslint-disable-next-line no-console
+  console.log(`Butler v3 listening on :${PORT}`)
+})
