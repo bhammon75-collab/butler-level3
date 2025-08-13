@@ -26,7 +26,7 @@ export const ENV = {
   BUTLER_TOKEN: need('BUTLER_TOKEN'),
 
   // Extra approval required to edit .github/workflows/*
-  // Callers must send header: X-Butler-Approve-Workflows: <WORKFLOW_EDIT_KEY>
+  // When set, callers MUST send header: X-Butler-Approve-Workflows: <WORKFLOW_EDIT_KEY>
   WORKFLOW_EDIT_KEY: need('WORKFLOW_EDIT_KEY'),
 
   // Safety limits
