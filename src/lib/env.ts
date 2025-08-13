@@ -18,7 +18,7 @@ export const ENV = {
   })(),
   INSTALLATION_ID: Number(need('INSTALLATION_ID')),
 
-  // Defaults for target repo (can be overridden in requests)
+  // Defaults for target repo (can be overridden per request)
   REPO_OWNER: process.env.REPO_OWNER || '',
   REPO_NAME: process.env.REPO_NAME || '',
 
@@ -26,5 +26,21 @@ export const ENV = {
   BUTLER_TOKEN: need('BUTLER_TOKEN'),
 
   // Extra approval required to edit .github/workflows/*
-  // When set, callers MUST send header: X-Butler-Approve-Workflows: <WORKFLOW_EDIT_KEY>
-  WORKFLOW_EDIT_KE
+  // Callers must send header: X-Butler-Approve-Workflows: <WORKFLOW_EDIT_KEY>
+  WORKFLOW_EDIT_KEY: process.env.WORKFLOW_EDIT_KEY || '',
+
+  // Safety limits
+  MAX_EDIT_COUNT: Number(process.env.MAX_EDIT_COUNT || 25),
+  MAX_FILE_SIZE_BYTES: Number(process.env.MAX_FILE_SIZE_BYTES || 200000),
+
+  // Optional tool configs (staging first)
+  SUPABASE_URL: process.env.SUPABASE_URL || '',
+  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || '',
+  SUPABASE_SERVICE_ROLE_KEY_STAGING: process.env.SUPABASE_SERVICE_ROLE_KEY_STAGING || '',
+  SUPABASE_SERVICE_ROLE_KEY_PROD: process.env.SUPABASE_SERVICE_ROLE_KEY_PROD || '',
+
+  RESEND_API_KEY_STAGING: process.env.RESEND_API_KEY_STAGING || '',
+  RESEND_API_KEY_PROD: process.env.RESEND_API_KEY_PROD || '',
+
+  VERCEL_DEPLOY_HOOK_URL: process.env.VERCEL_DEPLOY_HOOK_URL || ''
+}
