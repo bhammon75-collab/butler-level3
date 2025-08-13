@@ -27,7 +27,7 @@ export const ENV = {
 
   // Extra approval required to edit .github/workflows/*
   // Callers must send header: X-Butler-Approve-Workflows: <WORKFLOW_EDIT_KEY>
-  WORKFLOW_EDIT_KEY: process.env.WORKFLOW_EDIT_KEY || '',
+  WORKFLOW_EDIT_KEY: need('WORKFLOW_EDIT_KEY'),
 
   // Safety limits
   MAX_EDIT_COUNT: Number(process.env.MAX_EDIT_COUNT || 25),
