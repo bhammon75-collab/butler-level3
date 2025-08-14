@@ -1,155 +1,291 @@
-import express, { type Request, type Response, type NextFunction } from 'express'
-import { ENV } from './lib/env'
-import { isPathAllowed, isWorkflowPath } from './lib/allowlist'
-import { ghClient, mainSha, newBranch, getFile, decode, upsert, openPR } from './lib/github'
-import { ApplyReq, type ApplyReqT, RunReq, type RunReqT } from './types'
-import { loadPolicy, isAllowed } from './policy'
-import { githubTools } from './adapters/github'
-import { supabaseTools } from './adapters/supabase'
-import { stripeTools } from './adapters/stripe'
-import { deployTools } from './adapters/deploy'
-import { emailTools } from './adapters/email'
+// src/index.ts
+import express from "express";
+import cors from "cors";
+import { Octokit } from "octokit";
+import { createAppAuth } from "@octokit/auth-app";
+import { ENV } from "./lib/env";
+import { isPathAllowed, isWorkflowPath } from "./lib/allowlist";
 
-const app = express()
-app.use(express.json({ limit: '1mb' }))
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-// ----- Public endpoints (no auth)
-app.get('/', (_req, res) => {
-  res.type('text').send('Butler is live. Use /health or call /apply and /run with X-Butler-Token.')
-})
-app.get('/health', (_req, res) => res.json({ ok: true }))
+/** Health check (no auth) */
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
-// ----- Auth middleware (skip the public routes)
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (req.path === '/' || req.path === '/health') return next()
-  const token = req.header('X-Butler-Token')
-  if (token !== ENV.BUTLER_TOKEN) return res.status(401).json({ error: 'unauthorized' })
-  next()
-})
+/** Small helper: assert header secret */
+function requireToken(req: express.Request, res: express.Response): boolean {
+  const token = req.header("X-Butler-Token");
+  if (!token || token !== ENV.BUTLER_TOKEN) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
 
-// ----- /apply
-app.post('/apply', async (req: Request, res: Response) => {
-  let p: ApplyReqT
-  try {
-    p = ApplyReq.parse(req.body)
-  } catch (e: any) {
-    return res.status(400).json({ error: 'invalid', details: e?.errors ?? String(e) })
+/** Build an Octokit client authenticated as your GitHub App installation */
+function makeOctokit(): Octokit {
+  const appId = Number(ENV.APP_ID);
+  const installationId = Number(ENV.INSTALLATION_ID);
+  if (!appId) throw new Error("APP_ID missing/invalid");
+  if (!installationId) throw new Error("INSTALLATION_ID missing/invalid");
+
+  const privateKey =
+    ENV.PRIVATE_KEY_BASE64
+      ? Buffer.from(ENV.PRIVATE_KEY_BASE64, "base64").toString("utf8")
+      : ENV.PRIVATE_KEY;
+
+  if (!privateKey || !privateKey.includes("BEGIN") || !privateKey.includes("PRIVATE KEY")) {
+    throw new Error("Private key not configured correctly");
   }
 
-  const owner = p.owner || ENV.REPO_OWNER
-  const repo  = p.repo  || ENV.REPO_NAME
-  if (!owner || !repo) return res.status(400).json({ error: 'owner_repo_required' })
+  return new Octokit({
+    authStrategy: createAppAuth,
+    auth: {
+      appId,
+      privateKey,
+      installationId,
+    },
+  });
+}
+
+/** Allowlist + workflow-edit header gate */
+function validatePathsOrDie(req: express.Request, res: express.Response, edits: any[]): boolean {
+  for (const e of edits) {
+    const p = e.path || e.from;
+    if (!p) {
+      res.status(400).json({ error: "invalid", details: [{ path: ["edits", "path"], message: "Required" }] });
+      return false;
+    }
+    if (!isPathAllowed(p)) {
+      res.status(400).json({ error: "path_not_allowed", path: p });
+      return false;
+    }
+    if (isWorkflowPath(p)) {
+      const hdr = req.header("X-Butler-Approve-Workflows");
+      if (!hdr || hdr !== ENV.WORKFLOW_EDIT_KEY) {
+        res.status(403).json({ error: "workflow_edit_blocked", path: p });
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** Ensure branch exists (create from base if missing) and return its HEAD commit SHA */
+async function ensureBranchAndGetHeadSha(octokit: Octokit, owner: string, repo: string, branch: string, baseBranch: string): Promise<string> {
+  // Try to read the ref (branch)
+  try {
+    const ref = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+    return (ref.data.object as any).sha;
+  } catch (e: any) {
+    // If missing, create from base
+  }
+
+  // Get base branch commit sha
+  const baseRef = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
+  const baseSha = (baseRef.data.object as any).sha;
+
+  await octokit.rest.git.createRef({
+    owner,
+    repo,
+    ref: `refs/heads/${branch}`,
+    sha: baseSha,
+  });
+
+  return baseSha;
+}
+
+/** Create a commit with a batch of file edits and move the branch to it */
+async function commitBatch(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  branch: string,
+  parentSha: string,
+  edits: Array<
+    | { op: "write"; path: string; mode: "create" | "overwrite"; content: string }
+    | { op: "replace"; path: string; search: string; replace: string }
+  >
+): Promise<string> {
+  // Get the tree of the parent commit
+  const parentCommit = await octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
+  const baseTree = parentCommit.data.tree.sha;
+
+  // Build new blobs/entries
+  const treeEntries: Array<{ path: string; mode: string; type: "blob"; sha?: string; content?: string }> = [];
+
+  for (const e of edits) {
+    if (e.op === "write") {
+      // create/overwrite is the same at tree level; the ref decides what wins
+      treeEntries.push({
+        path: e.path,
+        mode: "100644",
+        type: "blob",
+        content: e.content,
+      });
+    } else if (e.op === "replace") {
+      // Fetch existing file content at branch HEAD
+      // If file does not exist, it's a no-op
+      try {
+        const { data } = await octokit.rest.repos.getContent({ owner, repo, path: e.path, ref: branch });
+        if (!("content" in data)) continue;
+        const current = Buffer.from((data as any).content, "base64").toString("utf8");
+        const next = current.replace(e.search, e.replace);
+        if (next === current) continue;
+
+        treeEntries.push({
+          path: e.path,
+          mode: "100644",
+          type: "blob",
+          content: next,
+        });
+      } catch {
+        // File missing → just skip
+        continue;
+      }
+    }
+  }
+
+  if (treeEntries.length === 0) {
+    throw Object.assign(new Error("no_change"), { code: "no_change" });
+  }
+
+  // Create a new tree
+  const newTree = await octokit.rest.git.createTree({
+    owner,
+    repo,
+    base_tree: baseTree,
+    tree: treeEntries,
+  });
+
+  // Create a new commit
+  const now = new Date().toISOString();
+  const commit = await octokit.rest.git.createCommit({
+    owner,
+    repo,
+    message: `butler: apply ${edits.length} edit(s) @ ${now}`,
+    tree: newTree.data.sha,
+    parents: [parentSha],
+  });
+
+  // Move the branch to the new commit
+  await octokit.rest.git.updateRef({
+    owner,
+    repo,
+    ref: `heads/${branch}`,
+    sha: commit.data.sha,
+    force: true,
+  });
+
+  return commit.data.sha;
+}
+
+/** POST /apply — create/append commit(s) and open a PR */
+app.post("/apply", async (req, res) => {
+  if (!requireToken(req, res)) return;
 
   try {
-    const gh = ghClient()
-    const baseSha = await mainSha(gh, owner, repo, p.baseBranch)
-    const branch = sanitize(p.branch)
-    await newBranch(gh, owner, repo, baseSha, branch)
+    const {
+      owner = ENV.REPO_OWNER,
+      repo = ENV.REPO_NAME,
+      branch,
+      baseBranch = "main",
+      prTitle,
+      prBody,
+      edits,
+      branchStrategy, // "reuse" | undefined
+      labels,
+      reviewers,
+    } = req.body || {};
 
-    for (const e of p.edits) {
-      if (!isPathAllowed(e.path)) {
-        return res.status(403).json({ error: 'path_not_allowed', path: e.path })
+    // Basic shape checks
+    if (!owner || !repo) return res.status(400).json({ error: "owner_repo_required" });
+    if (!branch || typeof branch !== "string") return res.status(400).json({ error: "invalid", details: [{ path: ["branch"], message: "Required" }] });
+    if (!prTitle || typeof prTitle !== "string") return res.status(400).json({ error: "invalid", details: [{ path: ["prTitle"], message: "Required" }] });
+    if (!Array.isArray(edits) || edits.length === 0) return res.status(400).json({ error: "invalid", details: [{ path: ["edits"], message: "Required" }] });
+
+    if (!validatePathsOrDie(req, res, edits)) return;
+
+    const octokit = makeOctokit();
+
+    // Resolve branch behavior
+    let headSha: string | null = null;
+
+    if (branchStrategy === "reuse") {
+      // If branch exists: use its head; else create from base
+      headSha = await ensureBranchAndGetHeadSha(octokit, owner, repo, branch, baseBranch);
+    } else {
+      // New-branch behavior: try to create; if exists, fail with a clear error
+      // Get base sha
+      const baseRef = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
+      const baseSha = (baseRef.data.object as any).sha;
+
+      // Try to create the branch
+      try {
+        await octokit.rest.git.createRef({
+          owner, repo,
+          ref: `refs/heads/${branch}`,
+          sha: baseSha,
+        });
+        headSha = baseSha;
+      } catch (err: any) {
+        // If it already exists, tell the client (matches your current UX)
+        return res.status(422).json({ error: "branch_exists", message: "Reference already exists", branch });
       }
-      if (isWorkflowPath(e.path)) {
-        const header = req.header('X-Butler-Approve-Workflows') || ''
-        if (!ENV.WORKFLOW_EDIT_KEY || header !== ENV.WORKFLOW_EDIT_KEY) {
-          return res.status(403).json({
-            error: 'workflow_edit_blocked',
-            hint: 'send X-Butler-Approve-Workflows header matching WORKFLOW_EDIT_KEY'
-          })
+    }
+
+    // Commit the batch
+    const newSha = await commitBatch(octokit, owner, repo, branch, headSha!, edits);
+
+    // Open PR if one doesn't already exist
+    let prUrl: string | null = null;
+    try {
+      // Try to find existing open PR from branch to base
+      const prs = await octokit.rest.pulls.list({
+        owner, repo, head: `${owner}:${branch}`, base: baseBranch, state: "open",
+      });
+      if (prs.data.length > 0) {
+        prUrl = prs.data[0].html_url;
+        // Optionally update title/body
+        await octokit.rest.pulls.update({ owner, repo, pull_number: prs.data[0].number, title: prTitle, body: prBody ?? undefined });
+      } else {
+        const pr = await octokit.rest.pulls.create({
+          owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
+        });
+        prUrl = pr.data.html_url;
+
+        // Optional cosmetics
+        if (Array.isArray(labels) && labels.length > 0) {
+          await octokit.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels });
+        }
+        if (Array.isArray(reviewers) && reviewers.length > 0) {
+          await octokit.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.data.number, reviewers });
         }
       }
-
-      if (e.op === 'write') {
-        let content =
-          e.encoding === 'base64'
-            ? Buffer.from(e.content, 'base64').toString('utf8')
-            : e.content
-        const existing = await getFile(gh, owner, repo, e.path)
-        if (e.mode === 'append' && existing) content = decode(existing) + '\n' + content
-        if (e.mode === 'create' && existing) continue
-        await upsert(gh, owner, repo, branch, e.path, content, `chore(ai): write ${e.path}`)
-      } else {
-        const existing = await getFile(gh, owner, repo, e.path)
-        if (!existing) return res.status(400).json({ error: 'file_not_found', path: e.path })
-        const before = decode(existing)
-        const after =
-          (e.all ?? true) ? before.split(e.search).join(e.replace) : before.replace(e.search, e.replace)
-        if (after === before) return res.status(400).json({ error: 'no_change', path: e.path })
-        await upsert(gh, owner, repo, branch, e.path, after, `chore(ai): replace in ${e.path}`)
-      }
+    } catch (e) {
+      // If listing PRs fails due to perms, just try to create
+      const pr = await octokit.rest.pulls.create({
+        owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
+      });
+      prUrl = pr.data.html_url;
     }
 
-    const prUrl = await openPR(gh, owner, repo, branch, p.baseBranch, p.prTitle, p.prBody)
-    return res.json({ ok: true, prUrl })
+    res.json({ ok: true, branch, prUrl, commit: newSha });
   } catch (err: any) {
-    return res.status(500).json({ error: 'apply_failed', message: err.message })
-  }
-})
-
-// ----- /run
-app.post('/run', async (req: Request, res: Response) => {
-  let plan: RunReqT
-  try {
-    plan = RunReq.parse(req.body)
-  } catch (e: any) {
-    return res.status(400).json({ error: 'invalid', details: e?.errors ?? String(e) })
-  }
-
-  const policy = loadPolicy()
-  const repoKey = 'default'
-  const results: Array<{ tool: string; action: string; ok: boolean; out?: unknown; error?: string }> = []
-
-  for (const step of plan.steps) {
-    const [tool, action = ''] = step.tool.split('.')
-    if (!isAllowed(policy, repoKey, tool, action, plan.env)) {
-      return res.status(403).json({ error: 'policy_block', tool, action, env: plan.env })
+    // Friendly errors
+    if (err?.code === "no_change") {
+      return res.status(400).json({ error: "no_change" });
     }
-    try {
-      const out = await dispatch(req, tool, action, step.args, plan)
-      results.push({ tool, action, ok: true, out })
-    } catch (err: any) {
-      results.push({ tool, action, ok: false, error: err.message })
-      return res.status(500).json({ error: 'step_failed', tool, action, message: err.message, results })
-    }
+    const msg = err?.message || String(err);
+    res.status(500).json({ error: "apply_failed", message: msg });
   }
+});
 
-  return res.json({ ok: true, results })
-})
-
-async function dispatch(req: Request, tool: string, action: string, args: Record<string, unknown>, _plan: RunReqT) {
-  if (tool === 'github' && action === 'write_file') {
-    const p = (args as any)?.path as string | undefined
-    if (p && isWorkflowPath(p)) {
-      const header = req.header('X-Butler-Approve-Workflows') || ''
-      if (!ENV.WORKFLOW_EDIT_KEY || header !== ENV.WORKFLOW_EDIT_KEY) {
-        throw new Error('workflow_edit_blocked: send X-Butler-Approve-Workflows header')
-      }
-    }
-  }
-  if (tool === 'github') {
-    if (action === 'create_branch') return githubTools.create_branch(args as any)
-    if (action === 'write_file')   return githubTools.write_file(args as any)
-    if (action === 'open_pr')      return githubTools.open_pr(args as any)
-  }
-  if (tool === 'supabase') {
-    if (action === 'deploy_function')  return supabaseTools.deploy_function(args as any)
-    if (action === 'set_function_env') return supabaseTools.set_function_env(args as any)
-    if (action === 'invoke_rpc')       return supabaseTools.invoke_rpc(args as any)
-    if (action === 'sql_migrate')      return supabaseTools.sql_migrate(args as any)
-  }
-  if (tool === 'stripe' && action === 'read_connect_account') return stripeTools.read_connect_account(args as any)
-  if (tool === 'deploy' && action === 'create_preview') return deployTools.create_preview(args as any)
-  if (tool === 'email'  && action === 'send_test') return emailTools.send_test(args as any)
-  throw new Error(`unknown_tool_or_action: ${tool}.${action}`)
-}
-
-function sanitize(b: string): string {
-  return b.trim().replace(/\s+/g, '-').replace(/[^a-zA-Z0-9/_-]/g, '').slice(0, 100)
-}
-
-const PORT = process.env.PORT || 8787
-app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`Butler v3 listening on :${PORT}`)
-})
+/** Start server (Render will set PORT) */
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => {
+  console.log(`[butler] listening on :${port}`);
+});
