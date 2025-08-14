@@ -1,0 +1,13 @@
+name: Auto-label Butler PRs
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add label
+        uses: actions-ecosystem/action-add-labels@v1
+        if: startsWith(github.head_ref, 'ai/')
+        with:
+          labels: butler
