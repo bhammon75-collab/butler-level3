@@ -3,7 +3,7 @@ info:
   title: Butler API
   version: "1.0.0"
 servers:
-  - url: https://<https://butler-level3.onrender.com>
+  - url: https://butler-level3.onrender.com
 paths:
   /plan:
     post:
