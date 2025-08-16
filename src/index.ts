@@ -3,7 +3,7 @@ import express from "express";
 import { Octokit } from "octokit";
 import { createAppAuth } from "@octokit/auth-app";
 import { ENV } from "./lib/env";
-import { isPathAllowed, isWorkflowPath } from "./lib/allowlist";
+import { isPathAllowed, isWorkflowPath, SAFE_WRITE_GLOBS } from "./lib/allowlist";
 
 /** Resolve the GitHub App private key from env (supports BASE64 or raw PEM). */
 function getPrivateKeyPEM(): string {
