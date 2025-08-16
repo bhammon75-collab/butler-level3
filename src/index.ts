@@ -1,6 +1,5 @@
 // src/index.ts
 import express from "express";
-import cors from "cors";
 import { Octokit } from "octokit";
 import { createAppAuth } from "@octokit/auth-app";
 import { ENV } from "./lib/env";
@@ -16,8 +15,17 @@ function getPrivateKeyPEM(): string {
 }
 
 const app = express();
-app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+
+/** Minimal CORS without deps */
+function simpleCors(req: express.Request, res: express.Response, next: express.NextFunction) {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-Butler-Token, X-Butler-Approve-Workflows");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+}
+app.use(simpleCors);
 
 /** Health check (no auth) */
 app.get("/health", (_req, res) => {
@@ -93,23 +101,17 @@ async function ensureBranchAndGetHeadSha(
   branch: string,
   baseBranch: string
 ): Promise<string> {
-  // Try to read the ref (branch)
   try {
     const ref = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
     return (ref.data.object as any).sha;
   } catch {
-    // If missing, create from base
+    // create from base
   }
-
-  // Get base branch commit sha
   const baseRef = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
   const baseSha = (baseRef.data.object as any).sha;
 
   await octokit.rest.git.createRef({
-    owner,
-    repo,
-    ref: `refs/heads/${branch}`,
-    sha: baseSha,
+    owner, repo, ref: `refs/heads/${branch}`, sha: baseSha,
   });
 
   return baseSha;
@@ -127,37 +129,22 @@ async function commitBatch(
     | { op: "replace"; path: string; search: string; replace: string }
   >
 ): Promise<string> {
-  // Get the tree of the parent commit
   const parentCommit = await octokit.rest.git.getCommit({ owner, repo, commit_sha: parentSha });
   const baseTree = parentCommit.data.tree.sha;
 
-  // Build new blobs/entries
   const treeEntries: Array<{ path: string; mode: string; type: "blob"; sha?: string; content?: string }> = [];
 
   for (const e of edits) {
     if (e.op === "write") {
-      // create/overwrite is the same at tree level; the ref decides what wins
-      treeEntries.push({
-        path: e.path,
-        mode: "100644",
-        type: "blob",
-        content: e.content,
-      });
+      treeEntries.push({ path: e.path, mode: "100644", type: "blob", content: e.content });
     } else if (e.op === "replace") {
-      // Fetch existing file content at branch HEAD; if file missing, skip
       try {
         const { data } = await octokit.rest.repos.getContent({ owner, repo, path: e.path, ref: branch });
         if (!("content" in data)) continue;
         const current = Buffer.from((data as any).content, "base64").toString("utf8");
         const next = current.replace(e.search, e.replace);
         if (next === current) continue;
-
-        treeEntries.push({
-          path: e.path,
-          mode: "100644",
-          type: "blob",
-          content: next,
-        });
+        treeEntries.push({ path: e.path, mode: "100644", type: "blob", content: next });
       } catch {
         continue;
       }
@@ -168,37 +155,23 @@ async function commitBatch(
     throw Object.assign(new Error("no_change"), { code: "no_change" });
   }
 
-  // Create a new tree
   const newTree = await octokit.rest.git.createTree({
-    owner,
-    repo,
-    base_tree: baseTree,
-    tree: treeEntries,
+    owner, repo, base_tree: baseTree, tree: treeEntries,
   });
 
-  // Create a new commit
   const now = new Date().toISOString();
   const commit = await octokit.rest.git.createCommit({
-    owner,
-    repo,
-    message: `butler: apply ${edits.length} edit(s) @ ${now}`,
-    tree: newTree.data.sha,
-    parents: [parentSha],
+    owner, repo, message: `butler: apply ${edits.length} edit(s) @ ${now}`, tree: newTree.data.sha, parents: [parentSha],
   });
 
-  // Move the branch to the new commit
   await octokit.rest.git.updateRef({
-    owner,
-    repo,
-    ref: `heads/${branch}`,
-    sha: commit.data.sha,
-    force: true,
+    owner, repo, ref: `heads/${branch}`, sha: commit.data.sha, force: true,
   });
 
   return commit.data.sha;
 }
 
-/** NEW: POST /plan — produce a conservative plan skeleton for a natural-language goal */
+/** POST /plan — conservative plan skeleton for a natural-language goal */
 app.post("/plan", async (req, res) => {
   if (!requireToken(req, res)) return;
 
@@ -206,15 +179,9 @@ app.post("/plan", async (req, res) => {
     type RepoRef = { owner: string; name: string };
     type FileEdit = { path: string; find?: string; replace?: string; insertAfter?: string; content?: string };
     type Plan = {
-      title: string;
-      summary: string;
-      edits: FileEdit[];
-      repo: RepoRef;
-      branch: string;
-      baseBranch: string;
-      labels?: string[];
-      reviewers?: string[];
-      runChecks?: boolean;
+      title: string; summary: string; edits: FileEdit[];
+      repo: RepoRef; branch: string; baseBranch: string;
+      labels?: string[]; reviewers?: string[]; runChecks?: boolean;
     };
 
     const { goal, repo, baseBranch = "main" } = req.body || {};
@@ -230,12 +197,9 @@ app.post("/plan", async (req, res) => {
       branch: `butler/${Date.now()}`,
       labels: ["butler"],
       runChecks: true,
-      // Intentionally empty: GPT or a follow-up step can populate edits,
-      // and /apply will enforce the allowlist + workflow approval header.
       edits: []
     };
 
-    // Optional hints so the caller knows the constraints up front
     const hints = {
       allowlistEnforcedAtApply: true,
       workflowEditsRequireHeader: "X-Butler-Approve-Workflows",
@@ -266,7 +230,6 @@ app.post("/apply", async (req, res) => {
       reviewers,
     } = req.body || {};
 
-    // Basic shape checks
     if (!owner || !repo) return res.status(400).json({ error: "owner_repo_required" });
     if (!branch || typeof branch !== "string") {
       return res.status(400).json({ error: "invalid", details: [{ path: ["branch"], message: "Required" }] });
@@ -282,49 +245,31 @@ app.post("/apply", async (req, res) => {
 
     const octokit = makeOctokit();
 
-    // Resolve branch behavior
     let headSha: string | null = null;
-
     if (branchStrategy === "reuse") {
-      // If branch exists: use its head; else create from base
       headSha = await ensureBranchAndGetHeadSha(octokit, owner, repo, branch, baseBranch);
     } else {
-      // New-branch behavior: try to create; if exists, fail with a clear error
       const baseRef = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
       const baseSha = (baseRef.data.object as any).sha;
-
       try {
-        await octokit.rest.git.createRef({
-          owner, repo,
-          ref: `refs/heads/${branch}`,
-          sha: baseSha,
-        });
+        await octokit.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: baseSha });
         headSha = baseSha;
       } catch {
         return res.status(422).json({ error: "branch_exists", message: "Reference already exists", branch });
       }
     }
 
-    // Commit the batch
     const newSha = await commitBatch(octokit, owner, repo, branch, headSha!, edits);
 
-    // Open PR if one doesn't already exist
     let prUrl: string | null = null;
     try {
-      const prs = await octokit.rest.pulls.list({
-        owner, repo, head: `${owner}:${branch}`, base: baseBranch, state: "open",
-      });
+      const prs = await octokit.rest.pulls.list({ owner, repo, head: `${owner}:${branch}`, base: baseBranch, state: "open" });
       if (prs.data.length > 0) {
         prUrl = prs.data[0].html_url;
-        await octokit.rest.pulls.update({
-          owner, repo, pull_number: prs.data[0].number, title: prTitle, body: prBody ?? undefined
-        });
+        await octokit.rest.pulls.update({ owner, repo, pull_number: prs.data[0].number, title: prTitle, body: prBody ?? undefined });
       } else {
-        const pr = await octokit.rest.pulls.create({
-          owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
-        });
+        const pr = await octokit.rest.pulls.create({ owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined });
         prUrl = pr.data.html_url;
-
         if (Array.isArray(labels) && labels.length > 0) {
           await octokit.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels });
         }
@@ -333,9 +278,7 @@ app.post("/apply", async (req, res) => {
         }
       }
     } catch {
-      const pr = await octokit.rest.pulls.create({
-        owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
-      });
+      const pr = await octokit.rest.pulls.create({ owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined });
       prUrl = pr.data.html_url;
     }
 
