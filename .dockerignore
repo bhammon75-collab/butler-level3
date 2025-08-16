@@ -1,0 +1,10 @@
+﻿node_modules
+dist
+.git
+.github
+Dockerfile.disabled
+*.log
+coverage
+.vscode
+.DS_Store
+.env*
