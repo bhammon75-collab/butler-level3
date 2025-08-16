@@ -26,6 +26,7 @@ export const SAFE_WRITE_GLOBS: string[] = [
   'docs/**',
   'README.md',
   'README*.md',
+    '*.md',
 
   // Common root config
   'config/**',        // <-- added
