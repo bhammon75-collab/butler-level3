@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import { SAFE_WRITE_GLOBS } from "./lib/allowlist";
+
 import { Octokit } from "octokit";
 import { createAppAuth } from "@octokit/auth-app";
 import { ENV } from "./lib/env";
