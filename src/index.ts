@@ -1,9 +1,11 @@
-// src/index.ts
 import express from "express";
+import cors from "cors";
 import { Octokit } from "octokit";
 import { createAppAuth } from "@octokit/auth-app";
 import { ENV } from "./lib/env";
-import { isPathAllowed, isWorkflowPath } from "./lib/allowlist";
+// ✅ make sure this import includes SAFE_WRITE_GLOBS
+import { isPathAllowed, isWorkflowPath, SAFE_WRITE_GLOBS } from "./lib/allowlist";
+
 
 /** Resolve the GitHub App private key from env (supports BASE64 or raw PEM). */
 function getPrivateKeyPEM(): string {
