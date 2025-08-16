@@ -1,5 +1,5 @@
 // src/index.ts
-import express from "express";
+import express, { type Request, type Response, type NextFunction } from "express";
 import cors from "cors";
 import { Octokit } from "octokit";
 import { createAppAuth } from "@octokit/auth-app";
@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 /** Minimal request logging (method, path, status, duration) */
-function requestLogger(req: express.Request, res: express.Response, next: express.NextFunction) {
+function requestLogger(req: Request, res: Response, next: NextFunction) {
   const start = Date.now();
   res.on("finish", () => {
     const ms = Date.now() - start;
@@ -31,19 +31,19 @@ function requestLogger(req: express.Request, res: express.Response, next: expres
 app.use(requestLogger);
 
 /** Health check (no auth) */
-app.get("/health", (_req, res) => {
+app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
 /** Status (no auth): deployed commit + allowlist + uptime */
-app.get("/status", (_req, res) => {
+app.get("/status", (_req: Request, res: Response) => {
   const commit = process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || null;
   const uptimeSec = Math.round(process.uptime());
   res.json({ ok: true, commit, allowlist: SAFE_WRITE_GLOBS, uptimeSec, now: new Date().toISOString() });
 });
 
 /** Assert header secret */
-function requireToken(req: express.Request, res: express.Response): boolean {
+function requireToken(req: Request, res: Response): boolean {
   const token = req.header("X-Butler-Token");
   if (!token || token !== ENV.BUTLER_TOKEN) {
     res.status(401).json({ error: "unauthorized" });
@@ -60,4 +60,8 @@ function makeOctokit(): Octokit {
   if (!installationId) throw new Error(`INSTALLATION_ID missing or invalid: ${ENV.INSTALLATION_ID}`);
 
   const privateKey = getPrivateKeyPEM();
+  if (!privateKey || !privateKey.includes("BEGIN") || !privateKey.includes("PRIVATE KEY")) {
+    throw new Error("Private key not configured correctly");
+  }
 
+  return new Octokit(
