@@ -6,6 +6,15 @@ import { createAppAuth } from "@octokit/auth-app";
 import { ENV } from "./lib/env";
 import { isPathAllowed, isWorkflowPath } from "./lib/allowlist";
 
+/** Resolve the GitHub App private key from env (supports BASE64 or raw PEM). */
+function getPrivateKeyPEM(): string {
+  const b64 = process.env.PRIVATE_KEY_BASE64;
+  if (b64 && b64.trim()) {
+    return Buffer.from(b64, "base64").toString("utf8");
+  }
+  return process.env.PRIVATE_KEY || "";
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -32,11 +41,7 @@ function makeOctokit(): Octokit {
   if (!appId) throw new Error("APP_ID missing/invalid");
   if (!installationId) throw new Error("INSTALLATION_ID missing/invalid");
 
-  const privateKey =
-    ENV.PRIVATE_KEY_BASE64
-      ? Buffer.from(ENV.PRIVATE_KEY_BASE64, "base64").toString("utf8")
-      : ENV.PRIVATE_KEY;
-
+  const privateKey = getPrivateKeyPEM();
   if (!privateKey || !privateKey.includes("BEGIN") || !privateKey.includes("PRIVATE KEY")) {
     throw new Error("Private key not configured correctly");
   }
@@ -52,11 +57,17 @@ function makeOctokit(): Octokit {
 }
 
 /** Allowlist + workflow-edit header gate */
-function validatePathsOrDie(req: express.Request, res: express.Response, edits: any[]): boolean {
+function validatePathsOrDie(
+  req: express.Request,
+  res: express.Response,
+  edits: any[]
+): boolean {
   for (const e of edits) {
     const p = e.path || e.from;
     if (!p) {
-      res.status(400).json({ error: "invalid", details: [{ path: ["edits", "path"], message: "Required" }] });
+      res
+        .status(400)
+        .json({ error: "invalid", details: [{ path: ["edits", "path"], message: "Required" }] });
       return false;
     }
     if (!isPathAllowed(p)) {
@@ -75,12 +86,18 @@ function validatePathsOrDie(req: express.Request, res: express.Response, edits: 
 }
 
 /** Ensure branch exists (create from base if missing) and return its HEAD commit SHA */
-async function ensureBranchAndGetHeadSha(octokit: Octokit, owner: string, repo: string, branch: string, baseBranch: string): Promise<string> {
+async function ensureBranchAndGetHeadSha(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  branch: string,
+  baseBranch: string
+): Promise<string> {
   // Try to read the ref (branch)
   try {
     const ref = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
     return (ref.data.object as any).sha;
-  } catch (e: any) {
+  } catch {
     // If missing, create from base
   }
 
@@ -127,8 +144,7 @@ async function commitBatch(
         content: e.content,
       });
     } else if (e.op === "replace") {
-      // Fetch existing file content at branch HEAD
-      // If file does not exist, it's a no-op
+      // Fetch existing file content at branch HEAD; if file missing, skip
       try {
         const { data } = await octokit.rest.repos.getContent({ owner, repo, path: e.path, ref: branch });
         if (!("content" in data)) continue;
@@ -143,7 +159,6 @@ async function commitBatch(
           content: next,
         });
       } catch {
-        // File missing → just skip
         continue;
       }
     }
@@ -203,9 +218,15 @@ app.post("/apply", async (req, res) => {
 
     // Basic shape checks
     if (!owner || !repo) return res.status(400).json({ error: "owner_repo_required" });
-    if (!branch || typeof branch !== "string") return res.status(400).json({ error: "invalid", details: [{ path: ["branch"], message: "Required" }] });
-    if (!prTitle || typeof prTitle !== "string") return res.status(400).json({ error: "invalid", details: [{ path: ["prTitle"], message: "Required" }] });
-    if (!Array.isArray(edits) || edits.length === 0) return res.status(400).json({ error: "invalid", details: [{ path: ["edits"], message: "Required" }] });
+    if (!branch || typeof branch !== "string") {
+      return res.status(400).json({ error: "invalid", details: [{ path: ["branch"], message: "Required" }] });
+    }
+    if (!prTitle || typeof prTitle !== "string") {
+      return res.status(400).json({ error: "invalid", details: [{ path: ["prTitle"], message: "Required" }] });
+    }
+    if (!Array.isArray(edits) || edits.length === 0) {
+      return res.status(400).json({ error: "invalid", details: [{ path: ["edits"], message: "Required" }] });
+    }
 
     if (!validatePathsOrDie(req, res, edits)) return;
 
@@ -219,11 +240,9 @@ app.post("/apply", async (req, res) => {
       headSha = await ensureBranchAndGetHeadSha(octokit, owner, repo, branch, baseBranch);
     } else {
       // New-branch behavior: try to create; if exists, fail with a clear error
-      // Get base sha
       const baseRef = await octokit.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
       const baseSha = (baseRef.data.object as any).sha;
 
-      // Try to create the branch
       try {
         await octokit.rest.git.createRef({
           owner, repo,
@@ -231,8 +250,7 @@ app.post("/apply", async (req, res) => {
           sha: baseSha,
         });
         headSha = baseSha;
-      } catch (err: any) {
-        // If it already exists, tell the client (matches your current UX)
+      } catch {
         return res.status(422).json({ error: "branch_exists", message: "Reference already exists", branch });
       }
     }
@@ -243,21 +261,20 @@ app.post("/apply", async (req, res) => {
     // Open PR if one doesn't already exist
     let prUrl: string | null = null;
     try {
-      // Try to find existing open PR from branch to base
       const prs = await octokit.rest.pulls.list({
         owner, repo, head: `${owner}:${branch}`, base: baseBranch, state: "open",
       });
       if (prs.data.length > 0) {
         prUrl = prs.data[0].html_url;
-        // Optionally update title/body
-        await octokit.rest.pulls.update({ owner, repo, pull_number: prs.data[0].number, title: prTitle, body: prBody ?? undefined });
+        await octokit.rest.pulls.update({
+          owner, repo, pull_number: prs.data[0].number, title: prTitle, body: prBody ?? undefined
+        });
       } else {
         const pr = await octokit.rest.pulls.create({
           owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
         });
         prUrl = pr.data.html_url;
 
-        // Optional cosmetics
         if (Array.isArray(labels) && labels.length > 0) {
           await octokit.rest.issues.addLabels({ owner, repo, issue_number: pr.data.number, labels });
         }
@@ -265,8 +282,7 @@ app.post("/apply", async (req, res) => {
           await octokit.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.data.number, reviewers });
         }
       }
-    } catch (e) {
-      // If listing PRs fails due to perms, just try to create
+    } catch {
       const pr = await octokit.rest.pulls.create({
         owner, repo, title: prTitle, head: branch, base: baseBranch, body: prBody ?? undefined,
       });
@@ -275,7 +291,6 @@ app.post("/apply", async (req, res) => {
 
     res.json({ ok: true, branch, prUrl, commit: newSha });
   } catch (err: any) {
-    // Friendly errors
     if (err?.code === "no_change") {
       return res.status(400).json({ error: "no_change" });
     }
