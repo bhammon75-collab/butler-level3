@@ -88,7 +88,7 @@ function validatePathsOrDie(req: Request, res: Response, edits: any[]): boolean 
     }
     if (isWorkflowPath(p)) {
       const hdr = req.header("X-Butler-Approve-Workflows");
-      if (!hdr || hdr !== ENV.WORKFLOW_EDIT_KEY) {
+      if (!approve || approve !== ENV.WORKFLOW_EDIT_KEY) {
         res.status(403).json({ error: "workflow_edit_blocked", path: p });
         return false;
       }
