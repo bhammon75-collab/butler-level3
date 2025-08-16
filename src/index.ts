@@ -198,6 +198,56 @@ async function commitBatch(
   return commit.data.sha;
 }
 
+/** NEW: POST /plan — produce a conservative plan skeleton for a natural-language goal */
+app.post("/plan", async (req, res) => {
+  if (!requireToken(req, res)) return;
+
+  try {
+    type RepoRef = { owner: string; name: string };
+    type FileEdit = { path: string; find?: string; replace?: string; insertAfter?: string; content?: string };
+    type Plan = {
+      title: string;
+      summary: string;
+      edits: FileEdit[];
+      repo: RepoRef;
+      branch: string;
+      baseBranch: string;
+      labels?: string[];
+      reviewers?: string[];
+      runChecks?: boolean;
+    };
+
+    const { goal, repo, baseBranch = "main" } = req.body || {};
+    if (!goal || !repo?.owner || !repo?.name) {
+      return res.status(400).json({ error: "invalid", details: [{ path: ["goal|repo"], message: "goal, repo.owner, repo.name required" }] });
+    }
+
+    const plan: Plan = {
+      title: `Butler: ${String(goal)}`.slice(0, 70),
+      summary: `Proposed changes for: ${goal}`,
+      repo: { owner: repo.owner, name: repo.name },
+      baseBranch,
+      branch: `butler/${Date.now()}`,
+      labels: ["butler"],
+      runChecks: true,
+      // Intentionally empty: GPT or a follow-up step can populate edits,
+      // and /apply will enforce the allowlist + workflow approval header.
+      edits: []
+    };
+
+    // Optional hints so the caller knows the constraints up front
+    const hints = {
+      allowlistEnforcedAtApply: true,
+      workflowEditsRequireHeader: "X-Butler-Approve-Workflows",
+    };
+
+    return res.json({ ok: true, plan, hints });
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    res.status(500).json({ error: "plan_failed", message: msg });
+  }
+});
+
 /** POST /apply — create/append commit(s) and open a PR */
 app.post("/apply", async (req, res) => {
   if (!requireToken(req, res)) return;
