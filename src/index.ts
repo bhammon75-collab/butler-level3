@@ -32,6 +32,13 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+/** Status (no auth) */
+app.get("/status", (_req, res) => {
+  const commit = process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || null;
+  const uptimeSec = Math.round(process.uptime());
+  res.json({ ok: true, commit, allowlist: SAFE_WRITE_GLOBS, uptimeSec, now: new Date().toISOString() });
+});
+
 /** Small helper: assert header secret */
 function requireToken(req: express.Request, res: express.Response): boolean {
   const token = req.header("X-Butler-Token");
